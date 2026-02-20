@@ -1,4 +1,4 @@
-# Windhager Heater
+# Windhager Heater Forked by FellowMate-sys
 
 This is a custom integration for Windhager heaters to be used with Home Assistant.
 
