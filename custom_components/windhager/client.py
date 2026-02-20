@@ -1,477 +1,214 @@
-import aiohttp
+from __future__ import annotations
+
 import logging
-from .aiohelper import DigestAuth
-from .const import DEFAULT_USERNAME, CLIMATE_FUNCTION_TYPE, HEATER_FUNCTION_TYPE
+from typing import Any, Optional
+
+from homeassistant.components.climate import (
+    ClimateEntity,
+    ClimateEntityFeature,
+    HVACMode,
+)
+from homeassistant.const import (
+    ATTR_TEMPERATURE,
+    UnitOfTemperature,
+)
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.core import HomeAssistant
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+
+# Try to import DOMAIN from const; fall back to hard-coded if missing.
+try:
+    from .const import DOMAIN  # type: ignore
+except Exception:  # pragma: no cover
+    DOMAIN = "windhager"
 
 _LOGGER = logging.getLogger(__name__)
 
-# -----------------------------------------------------------------------------
-# Optional: enable a one-time scan that logs every °C OID found under AeroWIN/LogWIN.
-# Leave False for normal operation. Set to True once to discover Storage/DHW OIDs.
-SCAN_TEMP_CANDIDATES = False
-TEMP_SCAN_NODES = (60, 65)   # Commonly AeroWIN (60) and LogWIN (65); adjust if needed
-TEMP_SCAN_GROUPS = (0, 1)    # Groups where temp datapoints often live
-TEMP_SCAN_MEMBERS = range(0, 120)
-# -----------------------------------------------------------------------------
+
+# ----------------------------- Helpers -----------------------------
+
+def _ensure_list(x) -> list:
+    return x if isinstance(x, list) else []
 
 
-# -------------------------- Value parsing utilities ---------------------------
-def _is_missing_or_sentinel(val: object) -> bool:
-    """Return True if a value is missing or a known sentinel like '-.-' or blank."""
+def _to_float_or_none(val: Any) -> Optional[float]:
     if val is None:
-        return True
+        return None
     sval = str(val).strip()
-    return sval in ("", "-.-", "NaN", "nan", "None")
+    if sval in ("", "-.-", "NaN", "nan", "None"):
+        return None
+    try:
+        return float(sval.replace(",", "."))
+    except Exception:
+        return None
 
 
-# ----------------------- Discovery helpers for /1 payload ---------------------
-def iter_um_zones_from_devices(devices):
-    """
-    Yield dicts for ALL unlocked climate functions (fctType == CLIMATE_FUNCTION_TYPE)
-    across all nodes discovered in /1.
-    Each item: {"node": <nodeId>, "fct_id": <fctId>, "label": <friendly name>}
-    """
-    if not isinstance(devices, list):
-        return
+# --- Minimal mode mapping ------------------------------------------
+# Your gateway returns an enum for /3/50/0. Without vendor docs, we keep
+# a conservative mapping that worked in field tests. Adjust if needed.
+# Example seen in your logs: values "4" and "5" are used.
+MODE_TO_HVAC = {
+    0: HVACMode.OFF,   # often "off" or standby
+    4: HVACMode.AUTO,  # commonly a scheduled/auto program
+    5: HVACMode.HEAT,  # comfort/manual heat program
+}
+HVAC_TO_MODE = {
+    HVACMode.OFF: 0,
+    HVACMode.AUTO: 4,
+    HVACMode.HEAT: 5,
+}
+# -------------------------------------------------------------------
+
+
+async def async_setup_entry(
+    hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
+) -> None:
+    """Set up Windhager climate entities from a config entry."""
+    data = hass.data[DOMAIN][entry.entry_id]
+    coordinator = data["coordinator"]
+    client = data["client"]
+
+    # Use coordinator snapshot if available; else force a fetch.
+    snapshot = coordinator.data or {}
+    devices = _ensure_list(snapshot.get("devices"))
+    if not devices:
+        _LOGGER.debug("No devices from coordinator snapshot; forcing initial fetch")
+        snapshot = await client.fetch_all()
+        devices = _ensure_list(snapshot.get("devices"))
+
+    entities: list[WindhagerClimate] = []
+
     for dev in devices:
-        try:
-            node_id = dev.get("nodeId")
-            functions = dev.get("functions", [])
-            for f in functions:
-                if f.get("fctType") == CLIMATE_FUNCTION_TYPE and not f.get("lock", False):
-                    yield {
-                        "node": node_id,
-                        "fct_id": f.get("fctId"),
-                        "label": f.get("name") or f"Zone {node_id}",
-                    }
-        except Exception:
-            # Continue on any malformed device entry
+        if dev.get("type") != "climate":
             continue
 
-
-async def scan_temp_candidates_for_nodes(client, nodes=TEMP_SCAN_NODES,
-                                         groups=TEMP_SCAN_GROUPS,
-                                         members=TEMP_SCAN_MEMBERS):
-    """
-    Log every OID under given nodes that returns a valid °C value.
-    Use this once to identify Storage and DHW tank temperature OIDs.
-    """
-    for node in nodes:
-        for grp in groups:
-            for mem in members:
-                oid = f"/1/{node}/0/{grp}/{mem}/0"
-                try:
-                    data = await client.fetch(oid)
-                except Exception:
-                    continue
-                if not data:
-                    continue
-                unit = data.get("unit")
-                val = data.get("value")
-                if unit == "°C" and not _is_missing_or_sentinel(val):
-                    _LOGGER.debug(
-                        "TEMP-CANDIDATE node=%s grp=%s mem=%s OID=%s -> %s°C name=%s",
-                        node, grp, mem, oid, val, data.get("name")
-                    )
-
-
-class WindhagerHttpClient:
-    """Raw API HTTP requests and discovery/aggregation for the Windhager gateway."""
-
-    def __init__(self, host, password) -> None:
-        self.host = host
-        self.password = password
-        self.oids = None               # set of OIDs to read
-        self.devices = []              # list of entity descriptors for HA
-        self._session = None
-        self._auth = None
-        self._did_temp_scan = False    # run the temp scan only once per process
-
-    async def _ensure_session(self):
-        """Ensure that we have an active client session."""
-        if self._session is None:
-            self._session = aiohttp.ClientSession()
-            self._auth = DigestAuth(DEFAULT_USERNAME, self.password, self._session)
-
-    async def close(self):
-        """Close the client session."""
-        if self._session:
-            await self._session.close()
-            self._session = None
-            self._auth = None
-
-    async def fetch(self, url):
-        """
-        Fetch a lookup endpoint.
-        Example: url="/1" or url="/1/15/0/1/1/0"
-        """
         try:
-            await self._ensure_session()
-            ret = await self._auth.request(
-                "GET", f"http://{self.host}/api/1.0/lookup{url}"
+            entity = WindhagerClimate(
+                coordinator=coordinator,
+                client=client,
+                device=dev,
             )
-            json = await ret.json()
-            _LOGGER.debug("Fetched data for %s: %s", url, json)
-            return json
-        except Exception as e:
-            _LOGGER.error("Failed to fetch data for %s: %s", url, str(e))
-            raise
+            entities.append(entity)
+        except Exception as ex:
+            _LOGGER.exception("Failed to create climate entity for %s: %s", dev, ex)
 
-    async def update(self, oid, value):
-        """Write a value back to a datapoint OID."""
-        await self._ensure_session()
-        await self._auth.request(
-            "PUT",
-            f"http://{self.host}/api/1.0/datapoint",
-            data=bytes(f'{{"OID":"{oid}","value":"{value}"}}', "utf-8"),
-        )
+    if entities:
+        async_add_entities(entities, update_before_add=True)
 
-    @staticmethod
-    def slugify(identifier_str):
-        return identifier_str.replace(".", "-").replace("/", "-")
 
-    async def fetch_all(self):
-        """
-        High-level:
-        1) On first call, discover all devices via /1 and build an entity list:
-           - ALL unlocked climate functions => one climate entity per function
-           - ALL unlocked heater functions => sensors for each heater
-           Collect all required OIDs into self.oids (a set).
-        2) Read every OID once and return:
-           { "devices": <entity descriptors>, "oids": { <oid>: value_or_None } }
-        """
-        # ---------------------- First-time discovery --------------------------
-        if self.oids is None:
-            self.oids = set()
-            self.devices = []
+class WindhagerClimate(CoordinatorEntity, ClimateEntity):
+    """HA Climate entity bound to a *single* Windhager function (zone)."""
 
-            # Discover gateway devices/functions
-            json_devices = await self.fetch("/1")
-            if not isinstance(json_devices, list):
-                _LOGGER.warning("Unexpected /1 discovery payload: %s", type(json_devices))
-                json_devices = []
+    _attr_supported_features = (
+        ClimateEntityFeature.TARGET_TEMPERATURE
+    )
+    _attr_temperature_unit = UnitOfTemperature.CELSIUS
 
-            # --------- CLIMATE: build entities for ALL unlocked climate funcs
-            for dev in json_devices:
-                node_id = dev.get("nodeId")
-                device_id_prefix = f"/1/{str(node_id)}"
-                functions = dev.get("functions", [])
+    def __init__(self, coordinator, client, device: dict[str, Any]) -> None:
+        super().__init__(coordinator)
+        self._client = client
+        self._dev = device
 
-                climate_functions = [
-                    f for f in functions
-                    if f.get("fctType") == CLIMATE_FUNCTION_TYPE and not f.get("lock", False)
-                ]
+        # Stable identity
+        self._attr_unique_id = f"{device['id']}-climate"
+        self._attr_name = device.get("name") or "Windhager Climate"
 
-                for fct in climate_functions:
-                    fct_id_str = f"/{str(fct.get('fctId'))}"
-                    zone_name = fct.get("name") or "Climate zone"
-
-                    # "climate" controller descriptor (bundle of OIDs)
-                    self.devices.append(
-                        {
-                            "id": self.slugify(f"{self.host}{device_id_prefix}{fct_id_str}"),
-                            "name": zone_name,
-                            "type": "climate",
-                            "prefix": device_id_prefix,
-                            "oids": [
-                                f"{fct_id_str}/0/1/0",  # current room temp
-                                f"{fct_id_str}/1/1/0",  # target temp
-                                f"{fct_id_str}/3/50/0", # operating mode enum
-                                f"{fct_id_str}/2/10/0", # custom temp duration (min)
-                                f"{fct_id_str}/3/58/0", # comfort correction
-                            ],
-                            "device_id": self.slugify(f"{self.host}{device_id_prefix}"),
-                            "device_name": zone_name,
-                        }
-                    )
-
-                    # OIDs required by this climate
-                    self.oids.update(
-                        [
-                            f"{device_id_prefix}{fct_id_str}/0/1/0",  # current temp
-                            f"{device_id_prefix}{fct_id_str}/1/1/0",  # target temp
-                            f"{device_id_prefix}{fct_id_str}/3/50/0", # mode
-                            f"{device_id_prefix}{fct_id_str}/2/10/0", # custom duration
-                            f"{device_id_prefix}{fct_id_str}/0/0/0",  # outside temp (replicated)
-                            f"{device_id_prefix}{fct_id_str}/3/58/0", # comfort correction
-                            f"{device_id_prefix}{fct_id_str}/3/7/0",  # temperature correction
-                        ]
-                    )
-
-                    # Current temperature (with correction reference)
-                    self.devices.append(
-                        {
-                            "id": self.slugify(
-                                f"{self.host}{device_id_prefix}{fct_id_str}/0/1/0/3/58/0"
-                            ),
-                            "name": f"{zone_name} Current Temperature",
-                            "type": "temperature",
-                            "correction_oid": f"{device_id_prefix}{fct_id_str}/3/58/0",
-                            "oid": f"{device_id_prefix}{fct_id_str}/0/1/0",
-                            "device_id": self.slugify(f"{self.host}{node_id}"),
-                            "device_name": zone_name,
-                        }
-                    )
-
-                    # Current temperature (raw/real)
-                    self.devices.append(
-                        {
-                            "id": self.slugify(
-                                f"{self.host}{device_id_prefix}{fct_id_str}/0/1/0"
-                            ),
-                            "name": f"{zone_name} Current Temperature real",
-                            "type": "temperature",
-                            "oid": f"{device_id_prefix}{fct_id_str}/0/1/0",
-                            "device_id": self.slugify(f"{self.host}{node_id}"),
-                            "device_name": zone_name,
-                        }
-                    )
-
-                    # Comfort temperature correction
-                    self.devices.append(
-                        {
-                            "id": self.slugify(
-                                f"{self.host}{device_id_prefix}{fct_id_str}/3/58/0"
-                            ),
-                            "name": f"{zone_name} Comfort Temperature Correction",
-                            "type": "sensor",
-                            "device_class": None,
-                            "state_class": None,
-                            "unit": "K",
-                            "oid": f"{device_id_prefix}{fct_id_str}/3/58/0",
-                            "device_id": self.slugify(f"{self.host}{node_id}"),
-                            "device_name": zone_name,
-                        }
-                    )
-
-                    # Current temperature correction
-                    self.devices.append(
-                        {
-                            "id": self.slugify(
-                                f"{self.host}{device_id_prefix}{fct_id_str}/3/7/0"
-                            ),
-                            "name": f"{zone_name} Current Temperature Correction",
-                            "type": "sensor",
-                            "device_class": None,
-                            "state_class": None,
-                            "unit": "K",
-                            "oid": f"{device_id_prefix}{fct_id_str}/3/7/0",
-                            "device_id": self.slugify(f"{self.host}{node_id}"),
-                            "device_name": zone_name,
-                        }
-                    )
-
-                    # Target temperature
-                    self.devices.append(
-                        {
-                            "id": self.slugify(
-                                f"{self.host}{device_id_prefix}{fct_id_str}/1/1/0"
-                            ),
-                            "name": f"{zone_name} Target Temperature",
-                            "type": "temperature",
-                            "correction_oid": f"{device_id_prefix}{fct_id_str}/3/58/0",
-                            "oid": f"{device_id_prefix}{fct_id_str}/1/1/0",
-                            "device_id": self.slugify(f"{self.host}{node_id}"),
-                            "device_name": zone_name,
-                        }
-                    )
-
-                    # Outside temperature
-                    self.devices.append(
-                        {
-                            "id": self.slugify(
-                                f"{self.host}{device_id_prefix}{fct_id_str}/0/0/0"
-                            ),
-                            "name": f"{zone_name} Outside Temperature",
-                            "type": "temperature",
-                            "oid": f"{device_id_prefix}{fct_id_str}/0/0/0",
-                            "device_id": self.slugify(f"{self.host}{node_id}"),
-                            "device_name": zone_name,
-                        }
-                    )
-
-            # --------- HEATERS: build sensors for ALL unlocked heater funcs
-            for dev in json_devices:
-                node_id = dev.get("nodeId")
-                device_id_prefix = f"/1/{str(node_id)}"
-                functions = dev.get("functions", [])
-
-                heater_functions = [
-                    f for f in functions
-                    if f.get("fctType") == HEATER_FUNCTION_TYPE and not f.get("lock", False)
-                ]
-
-                for fct in heater_functions:
-                    fct_id_str = f"/{str(fct.get('fctId'))}"
-                    heater_name = fct.get("name") or "Heater"
-
-                    # Collect heater OIDs
-                    self.oids.update(
-                        [
-                            f"{device_id_prefix}{fct_id_str}/0/9/0",   # power (%)
-                            f"{device_id_prefix}{fct_id_str}/0/11/0",  # fumes temp
-                            f"{device_id_prefix}{fct_id_str}/0/7/0",   # heater temp
-                            f"{device_id_prefix}{fct_id_str}/0/45/0",  # combustion chamber temp
-                            f"{device_id_prefix}{fct_id_str}/2/1/0",   # heater status
-                            f"{device_id_prefix}{fct_id_str}/23/100/0",# pellet cons.
-                            f"{device_id_prefix}{fct_id_str}/23/103/0",# total pellet cons.
-                            f"{device_id_prefix}{fct_id_str}/20/61/0", # time to cleaning 1
-                            f"{device_id_prefix}{fct_id_str}/20/62/0", # time to cleaning 2
-                        ]
-                    )
-
-                    # Heater current power factor
-                    self.devices.append(
-                        {
-                            "id": self.slugify(f"{self.host}{device_id_prefix}{fct_id_str}/0/9/0"),
-                            "name": f"{heater_name} Power factor",
-                            "type": "sensor",
-                            "device_class": "power_factor",
-                            "state_class": None,
-                            "unit": "%",
-                            "oid": f"{device_id_prefix}{fct_id_str}/0/9/0",
-                            "device_id": self.slugify(f"{self.host}{node_id}"),
-                            "device_name": heater_name,
-                        }
-                    )
-                    # Fumes temperature
-                    self.devices.append(
-                        {
-                            "id": self.slugify(f"{self.host}{device_id_prefix}{fct_id_str}/0/11/0"),
-                            "name": f"{heater_name} Fumes Temperature",
-                            "type": "temperature",
-                            "oid": f"{device_id_prefix}{fct_id_str}/0/11/0",
-                            "device_id": self.slugify(f"{self.host}{node_id}"),
-                            "device_name": heater_name,
-                        }
-                    )
-                    # Heater temperature
-                    self.devices.append(
-                        {
-                            "id": self.slugify(f"{self.host}{device_id_prefix}{fct_id_str}/0/7/0"),
-                            "name": f"{heater_name} Heater Temperature",
-                            "type": "temperature",
-                            "oid": f"{device_id_prefix}{fct_id_str}/0/7/0",
-                            "device_id": self.slugify(f"{self.host}{node_id}"),
-                            "device_name": heater_name,
-                        }
-                    )
-                    # Combustion chamber temperature
-                    self.devices.append(
-                        {
-                            "id": self.slugify(f"{self.host}{device_id_prefix}{fct_id_str}/0/45/0"),
-                            "name": f"{heater_name} Combustion chamber Temperature",
-                            "type": "temperature",
-                            "oid": f"{device_id_prefix}{fct_id_str}/0/45/0",
-                            "device_id": self.slugify(f"{self.host}{node_id}"),
-                            "device_name": heater_name,
-                        }
-                    )
-                    # Heater status
-                    self.devices.append(
-                        {
-                            "id": self.slugify(f"{self.host}{device_id_prefix}{fct_id_str}/2/1/0"),
-                            "name": f"{heater_name} Heater status",
-                            "options": [
-                                "Brûleur bloqué",
-                                "Autotest",
-                                "Eteindre gén. chaleur",
-                                "Veille",
-                                "Brûleur ARRET",
-                                "Prérinçage",
-                                "Phase d'allumage",
-                                "Stabilisation flamme",
-                                "Mode modulant",
-                                "Chaudière bloqué",
-                                "Veille temps différé",
-                                "Ventilateur Arrêté",
-                                "Porte de revêtement ouverte",
-                                "Allumage prêt",
-                                "Annuler phase d'allumage",
-                                "Préchauffage en cours",
-                            ],
-                            "type": "select",
-                            "oid": f"{device_id_prefix}{fct_id_str}/2/1/0",
-                            "device_id": self.slugify(f"{self.host}{node_id}"),
-                            "device_name": heater_name,
-                        }
-                    )
-                    # Pellet consumption
-                    self.devices.append(
-                        {
-                            "id": self.slugify(f"{self.host}{device_id_prefix}{fct_id_str}/23/100/0"),
-                            "name": f"{heater_name} Pellet consumption",
-                            "type": "total",
-                            "oid": f"{device_id_prefix}{fct_id_str}/23/100/0",
-                            "device_id": self.slugify(f"{self.host}{node_id}"),
-                            "device_name": heater_name,
-                        }
-                    )
-                    # Total pellet consumption
-                    self.devices.append(
-                        {
-                            "id": self.slugify(f"{self.host}{device_id_prefix}{fct_id_str}/23/103/0"),
-                            "name": f"{heater_name} Total Pellet consumption",
-                            "type": "total_increasing",
-                            "oid": f"{device_id_prefix}{fct_id_str}/23/103/0",
-                            "device_id": self.slugify(f"{self.host}{node_id}"),
-                            "device_name": heater_name,
-                        }
-                    )
-                    # Running time until stage 1 cleaning
-                    self.devices.append(
-                        {
-                            "id": self.slugify(f"{self.host}{device_id_prefix}{fct_id_str}/20/61/0"),
-                            "name": f"{heater_name} Running time until stage 1 cleaning",
-                            "type": "sensor",
-                            "device_class": "duration",
-                            "state_class": None,
-                            "unit": "h",
-                            "oid": f"{device_id_prefix}{fct_id_str}/20/61/0",
-                            "device_id": self.slugify(f"{self.host}{node_id}"),
-                            "device_name": heater_name,
-                        }
-                    )
-                    # Running time until stage 2 cleaning
-                    self.devices.append(
-                        {
-                            "id": self.slugify(f"{self.host}{device_id_prefix}{fct_id_str}/20/62/0"),
-                            "name": f"{heater_name} Running time until stage 2 cleaning",
-                            "type": "sensor",
-                            "device_class": "duration",
-                            "state_class": None,
-                            "unit": "h",
-                            "oid": f"{device_id_prefix}{fct_id_str}/20/62/0",
-                            "device_id": self.slugify(f"{self.host}{node_id}"),
-                            "device_name": heater_name,
-                        }
-                    )
-
-            # (Optional) one-time temp scan to discover Storage/DHW OIDs
-            if SCAN_TEMP_CANDIDATES and not self._did_temp_scan:
-                try:
-                    await scan_temp_candidates_for_nodes(self)
-                except Exception:
-                    pass
-                self._did_temp_scan = True
-
-        # -------------------------- Read all OIDs ------------------------------
-        ret = {
-            "devices": self.devices,
-            "oids": {},
+        # Make **each zone a separate HA device** (critical for your setup)
+        self._device_id = device.get("device_id") or device["id"]
+        self._device_name = device.get("device_name") or self._attr_name
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, self._device_id)},
+            "name": self._device_name,
+            "manufacturer": "Windhager",
+            "model": "InfoWin / RC7030",
         }
 
-        # Preserve original semantics: keep raw "value" unless sentinel, else None
-        for oid in self.oids:
-            try:
-                json = await self.fetch(oid)
-                if "value" in json and not _is_missing_or_sentinel(json.get("value")):
-                    ret["oids"][oid] = json.get("value")
-                else:
-                    ret["oids"][oid] = None
-                    _LOGGER.debug("Invalid or missing value for OID %s: %s", oid, json)
-            except Exception as e:
-                ret["oids"][oid] = None
-                _LOGGER.error("Error while fetching OID %s: %s", oid, str(e))
+        # Build absolute OIDs from the function-specific prefix + relative oids
+        prefix = device.get("prefix")  # like "/1/15"
+        rel_oids = _ensure_list(device.get("oids"))
 
-        return ret
+        # We expect the relative OIDs in the order your client.py provides:
+        # 0: current temp, 1: target temp, 2: mode, 3: custom time, 4: comfort corr
+        self._oid_current = f"{prefix}{rel_oids[0]}" if len(rel_oids) > 0 else None
+        self._oid_target = f"{prefix}{rel_oids[1]}" if len(rel_oids) > 1 else None
+        self._oid_mode   = f"{prefix}{rel_oids[2]}" if len(rel_oids) > 2 else None
+        self._oid_custom = f"{prefix}{rel_oids[3]}" if len(rel_oids) > 3 else None
+        self._oid_corr   = f"{prefix}{rel_oids[4]}" if len(rel_oids) > 4 else None
+
+        # Internal state mirrors
+        self._curr_temp: Optional[float] = None
+        self._tgt_temp: Optional[float] = None
+        self._mode_val: Optional[int] = None
+
+        # Available HVAC modes we expose (adjust if your plant has others)
+        self._attr_hvac_modes = [HVACMode.OFF, HVACMode.AUTO, HVACMode.HEAT]
+
+    # --------------------- State properties ---------------------
+
+    @property
+    def hvac_mode(self) -> HVACMode:
+        """Return the current HVAC mode mapped from /3/50/0 enum."""
+        self._read_snapshot()
+        if self._mode_val is None:
+            return HVACMode.AUTO  # default if unknown
+        return MODE_TO_HVAC.get(self._mode_val, HVACMode.HEAT)
+
+    @property
+    def current_temperature(self) -> Optional[float]:
+        self._read_snapshot()
+        return self._curr_temp
+
+    @property
+    def target_temperature(self) -> Optional[float]:
+        self._read_snapshot()
+        return self._tgt_temp
+
+    # --------------------- Commands (writes) ---------------------
+
+    async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
+        """Set hvac mode by writing the function-specific mode OID."""
+        if not self._oid_mode:
+            _LOGGER.warning("%s has no mode OID; ignoring set_hvac_mode", self.name)
+            return
+        if hvac_mode not in self.hvac_modes:
+            raise ValueError(f"Unsupported HVAC mode: {hvac_mode}")
+        mode_val = HVAC_TO_MODE.get(hvac_mode)
+        if mode_val is None:
+            _LOGGER.warning("No gateway mapping for HVAC mode %s; skipping", hvac_mode)
+            return
+        await self._client.update(self._oid_mode, mode_val)
+        await self.coordinator.async_request_refresh()
+
+    async def async_set_temperature(self, **kwargs: Any) -> None:
+        """Set target temperature for this zone only."""
+        if not self._oid_target:
+            _LOGGER.warning("%s has no target OID; ignoring set_temperature", self.name)
+            return
+        if ATTR_TEMPERATURE not in kwargs:
+            return
+        new_t = kwargs[ATTR_TEMPERATURE]
+        await self._client.update(self._oid_target, new_t)
+        await self.coordinator.async_request_refresh()
+
+    # --------------------- Coordinator → entity sync ---------------------
+
+    def _read_snapshot(self) -> None:
+        """Pull the latest values for *this zone only* from coordinator.data['oids']."""
+        data = self.coordinator.data or {}
+        oids = data.get("oids") or {}
+        if self._oid_current:
+            self._curr_temp = _to_float_or_none(oids.get(self._oid_current))
+        if self._oid_target:
+            self._tgt_temp = _to_float_or_none(oids.get(self._oid_target))
+        if self._oid_mode:
+            try:
+                raw = oids.get(self._oid_mode)
+                self._mode_val = int(str(raw)) if raw is not None and str(raw).strip() != "" else None
+            except Exception:
+                self._mode_val = None
+
+    async def async_update(self) -> None:
+        """Let CoordinatorEntity drive updates; no direct I/O here."""
+        # Coordinator handles fetching; we just mirror values.
+        return
