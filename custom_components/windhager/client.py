@@ -270,3 +270,208 @@ class WindhagerHttpClient:
                             "name": f"{zone_name} Target Temperature",
                             "type": "temperature",
                             "correction_oid": f"{device_id_prefix}{fct_id_str}/3/58/0",
+                            "oid": f"{device_id_prefix}{fct_id_str}/1/1/0",
+                            "device_id": self.slugify(f"{self.host}{node_id}"),
+                            "device_name": zone_name,
+                        }
+                    )
+
+                    # Outside temperature
+                    self.devices.append(
+                        {
+                            "id": self.slugify(
+                                f"{self.host}{device_id_prefix}{fct_id_str}/0/0/0"
+                            ),
+                            "name": f"{zone_name} Outside Temperature",
+                            "type": "temperature",
+                            "oid": f"{device_id_prefix}{fct_id_str}/0/0/0",
+                            "device_id": self.slugify(f"{self.host}{node_id}"),
+                            "device_name": zone_name,
+                        }
+                    )
+
+            # --------- HEATERS: build sensors for ALL unlocked heater funcs
+            for dev in json_devices:
+                node_id = dev.get("nodeId")
+                device_id_prefix = f"/1/{str(node_id)}"
+                functions = dev.get("functions", [])
+
+                heater_functions = [
+                    f for f in functions
+                    if f.get("fctType") == HEATER_FUNCTION_TYPE and not f.get("lock", False)
+                ]
+
+                for fct in heater_functions:
+                    fct_id_str = f"/{str(fct.get('fctId'))}"
+                    heater_name = fct.get("name") or "Heater"
+
+                    # Collect heater OIDs
+                    self.oids.update(
+                        [
+                            f"{device_id_prefix}{fct_id_str}/0/9/0",   # power (%)
+                            f"{device_id_prefix}{fct_id_str}/0/11/0",  # fumes temp
+                            f"{device_id_prefix}{fct_id_str}/0/7/0",   # heater temp
+                            f"{device_id_prefix}{fct_id_str}/0/45/0",  # combustion chamber temp
+                            f"{device_id_prefix}{fct_id_str}/2/1/0",   # heater status
+                            f"{device_id_prefix}{fct_id_str}/23/100/0",# pellet cons.
+                            f"{device_id_prefix}{fct_id_str}/23/103/0",# total pellet cons.
+                            f"{device_id_prefix}{fct_id_str}/20/61/0", # time to cleaning 1
+                            f"{device_id_prefix}{fct_id_str}/20/62/0", # time to cleaning 2
+                        ]
+                    )
+
+                    # Heater current power factor
+                    self.devices.append(
+                        {
+                            "id": self.slugify(f"{self.host}{device_id_prefix}{fct_id_str}/0/9/0"),
+                            "name": f"{heater_name} Power factor",
+                            "type": "sensor",
+                            "device_class": "power_factor",
+                            "state_class": None,
+                            "unit": "%",
+                            "oid": f"{device_id_prefix}{fct_id_str}/0/9/0",
+                            "device_id": self.slugify(f"{self.host}{node_id}"),
+                            "device_name": heater_name,
+                        }
+                    )
+                    # Fumes temperature
+                    self.devices.append(
+                        {
+                            "id": self.slugify(f"{self.host}{device_id_prefix}{fct_id_str}/0/11/0"),
+                            "name": f"{heater_name} Fumes Temperature",
+                            "type": "temperature",
+                            "oid": f"{device_id_prefix}{fct_id_str}/0/11/0",
+                            "device_id": self.slugify(f"{self.host}{node_id}"),
+                            "device_name": heater_name,
+                        }
+                    )
+                    # Heater temperature
+                    self.devices.append(
+                        {
+                            "id": self.slugify(f"{self.host}{device_id_prefix}{fct_id_str}/0/7/0"),
+                            "name": f"{heater_name} Heater Temperature",
+                            "type": "temperature",
+                            "oid": f"{device_id_prefix}{fct_id_str}/0/7/0",
+                            "device_id": self.slugify(f"{self.host}{node_id}"),
+                            "device_name": heater_name,
+                        }
+                    )
+                    # Combustion chamber temperature
+                    self.devices.append(
+                        {
+                            "id": self.slugify(f"{self.host}{device_id_prefix}{fct_id_str}/0/45/0"),
+                            "name": f"{heater_name} Combustion chamber Temperature",
+                            "type": "temperature",
+                            "oid": f"{device_id_prefix}{fct_id_str}/0/45/0",
+                            "device_id": self.slugify(f"{self.host}{node_id}"),
+                            "device_name": heater_name,
+                        }
+                    )
+                    # Heater status
+                    self.devices.append(
+                        {
+                            "id": self.slugify(f"{self.host}{device_id_prefix}{fct_id_str}/2/1/0"),
+                            "name": f"{heater_name} Heater status",
+                            "options": [
+                                "Brûleur bloqué",
+                                "Autotest",
+                                "Eteindre gén. chaleur",
+                                "Veille",
+                                "Brûleur ARRET",
+                                "Prérinçage",
+                                "Phase d'allumage",
+                                "Stabilisation flamme",
+                                "Mode modulant",
+                                "Chaudière bloqué",
+                                "Veille temps différé",
+                                "Ventilateur Arrêté",
+                                "Porte de revêtement ouverte",
+                                "Allumage prêt",
+                                "Annuler phase d'allumage",
+                                "Préchauffage en cours",
+                            ],
+                            "type": "select",
+                            "oid": f"{device_id_prefix}{fct_id_str}/2/1/0",
+                            "device_id": self.slugify(f"{self.host}{node_id}"),
+                            "device_name": heater_name,
+                        }
+                    )
+                    # Pellet consumption
+                    self.devices.append(
+                        {
+                            "id": self.slugify(f"{self.host}{device_id_prefix}{fct_id_str}/23/100/0"),
+                            "name": f"{heater_name} Pellet consumption",
+                            "type": "total",
+                            "oid": f"{device_id_prefix}{fct_id_str}/23/100/0",
+                            "device_id": self.slugify(f"{self.host}{node_id}"),
+                            "device_name": heater_name,
+                        }
+                    )
+                    # Total pellet consumption
+                    self.devices.append(
+                        {
+                            "id": self.slugify(f"{self.host}{device_id_prefix}{fct_id_str}/23/103/0"),
+                            "name": f"{heater_name} Total Pellet consumption",
+                            "type": "total_increasing",
+                            "oid": f"{device_id_prefix}{fct_id_str}/23/103/0",
+                            "device_id": self.slugify(f"{self.host}{node_id}"),
+                            "device_name": heater_name,
+                        }
+                    )
+                    # Running time until stage 1 cleaning
+                    self.devices.append(
+                        {
+                            "id": self.slugify(f"{self.host}{device_id_prefix}{fct_id_str}/20/61/0"),
+                            "name": f"{heater_name} Running time until stage 1 cleaning",
+                            "type": "sensor",
+                            "device_class": "duration",
+                            "state_class": None,
+                            "unit": "h",
+                            "oid": f"{device_id_prefix}{fct_id_str}/20/61/0",
+                            "device_id": self.slugify(f"{self.host}{node_id}"),
+                            "device_name": heater_name,
+                        }
+                    )
+                    # Running time until stage 2 cleaning
+                    self.devices.append(
+                        {
+                            "id": self.slugify(f"{self.host}{device_id_prefix}{fct_id_str}/20/62/0"),
+                            "name": f"{heater_name} Running time until stage 2 cleaning",
+                            "type": "sensor",
+                            "device_class": "duration",
+                            "state_class": None,
+                            "unit": "h",
+                            "oid": f"{device_id_prefix}{fct_id_str}/20/62/0",
+                            "device_id": self.slugify(f"{self.host}{node_id}"),
+                            "device_name": heater_name,
+                        }
+                    )
+
+            # (Optional) one-time temp scan to discover Storage/DHW OIDs
+            if SCAN_TEMP_CANDIDATES and not self._did_temp_scan:
+                try:
+                    await scan_temp_candidates_for_nodes(self)
+                except Exception:
+                    pass
+                self._did_temp_scan = True
+
+        # -------------------------- Read all OIDs ------------------------------
+        ret = {
+            "devices": self.devices,
+            "oids": {},
+        }
+
+        # Preserve original semantics: keep raw "value" unless sentinel, else None
+        for oid in self.oids:
+            try:
+                json = await self.fetch(oid)
+                if "value" in json and not _is_missing_or_sentinel(json.get("value")):
+                    ret["oids"][oid] = json.get("value")
+                else:
+                    ret["oids"][oid] = None
+                    _LOGGER.debug("Invalid or missing value for OID %s: %s", oid, json)
+            except Exception as e:
+                ret["oids"][oid] = None
+                _LOGGER.error("Error while fetching OID %s: %s", oid, str(e))
+
+        return ret
