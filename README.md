@@ -1,4 +1,4 @@
-# Windhager Heater
+# Windhager Heater Test new Features
 
 This is a custom integration for Windhager heaters to be used with Home Assistant.
 
