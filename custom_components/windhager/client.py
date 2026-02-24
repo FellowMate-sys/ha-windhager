@@ -69,153 +69,129 @@ class WindhagerHttpClient:
                     _LOGGER.debug("Device %s has no functions, skipping.", device_id)
                     continue
 
-                # Filter climate controls
-                functions = list(
-                    filter(
-                        lambda f: (
-                            f["fctType"] == CLIMATE_FUNCTION_TYPE and f["lock"] is False
-                        ),
-                        device["functions"],
-                    )
-                )
-                if len(functions) > 0:
-                    fct_id = f"/{str(functions[0]['fctId'])}"
+                # Filter climate controls (heating circuits), include ALL fctIds (e.g., 0, 1, ...)
+                climate_functions = [
+                    f for f in device["functions"]
+                    if f.get("fctType") == CLIMATE_FUNCTION_TYPE and f.get("lock") is False
+                ]
 
-                    # Climate control
+                for cf in climate_functions:
+                    fct_id = f"/{str(cf['fctId'])}"
+                    f_name = cf.get("name", f"HK {cf['fctId']}")
+                    # make device_id unique per node and fctId
+                    device_id_with_fct = self.slugify(f"{self.host}{device_id}{fct_id}")
+
+                    # ---- Climate control (parent) device ----
                     self.devices.append(
                         {
-                            "id": self.slugify(f"{self.host}{device_id}"),
-                            "name": functions[0]["name"],
+                            "id": device_id_with_fct,
+                            "name": f_name,
                             "type": "climate",
                             "prefix": device_id,
                             "oids": [
-                                f"{fct_id}/0/1/0",
-                                f"{fct_id}/1/1/0",
-                                f"{fct_id}/3/50/0",
-                                f"{fct_id}/2/10/0",
-                                f"{fct_id}/3/58/0",
+                                f"{fct_id}/0/1/0",  # current room temperature
+                                f"{fct_id}/1/1/0",  # target room temperature
+                                f"{fct_id}/3/50/0", # mode
+                                f"{fct_id}/2/10/0", # duration (custom temp)
+                                f"{fct_id}/3/58/0", # comfort correction
                             ],
-                            "device_id": self.slugify(f"{self.host}{device_id}"),
-                            "device_name": functions[0]["name"],
+                            "device_id": device_id_with_fct,
+                            "device_name": f_name,
                         }
                     )
+
+                    # Register all OIDs needed for this fctId
                     self.oids.update(
                         [
-                            # Current temperature
-                            f"{device_id}{fct_id}/0/1/0",
-                            # Target temperature
-                            f"{device_id}{fct_id}/1/1/0",
-                            # Current selected mode
-                            f"{device_id}{fct_id}/3/50/0",
-                            # Duration of custom temperature (in minutes)
-                            f"{device_id}{fct_id}/2/10/0",
-                            # Outside temperature
-                            f"{device_id}{fct_id}/0/0/0",
-                            # Temp comfort correction
-                            f"{device_id}{fct_id}/3/58/0",
-                            # Tempe correction
-                            f"{device_id}{fct_id}/3/7/0",
+                            f"{device_id}{fct_id}/0/1/0",  # Current temperature
+                            f"{device_id}{fct_id}/1/1/0",  # Target temperature
+                            f"{device_id}{fct_id}/3/50/0", # Mode
+                            f"{device_id}{fct_id}/2/10/0", # Custom temp duration (min)
+                            f"{device_id}{fct_id}/0/0/0",  # Outside temperature
+                            f"{device_id}{fct_id}/3/58/0", # Comfort correction
+                            f"{device_id}{fct_id}/3/7/0",  # Current temp correction
                         ]
                     )
 
-                    # Current temperature
+                    # ---- Child entities ----
+
+                    # Current temperature (with correction)
                     self.devices.append(
                         {
-                            "id": self.slugify(
-                                f"{self.host}/1/{str(device['nodeId'])}{fct_id}/0/1/0/3/58/0"
-                            ),
-                            "name": f"{functions[0]['name']} Current Temperature",
+                            "id": self.slugify(f"{self.host}{device_id}{fct_id}/0/1/0/with_corr"),
+                            "name": f"{f_name} Current Temperature",
                             "type": "temperature",
                             "correction_oid": f"{device_id}{fct_id}/3/58/0",
                             "oid": f"{device_id}{fct_id}/0/1/0",
-                            "device_id": self.slugify(
-                                f"{self.host}{str(device['nodeId'])}"
-                            ),
-                            "device_name": functions[0]["name"],
+                            "device_id": device_id_with_fct,
+                            "device_name": f_name,
                         }
                     )
 
-                    # Current temperature (real)
+                    # Current temperature (raw)
                     self.devices.append(
                         {
-                            "id": self.slugify(
-                                f"{self.host}/1/{str(device['nodeId'])}{fct_id}/0/1/0"
-                            ),
-                            "name": f"{functions[0]['name']} Current Temperature real",
+                            "id": self.slugify(f"{self.host}{device_id}{fct_id}/0/1/0/raw"),
+                            "name": f"{f_name} Current Temperature real",
                             "type": "temperature",
                             "oid": f"{device_id}{fct_id}/0/1/0",
-                            "device_id": self.slugify(
-                                f"{self.host}{str(device['nodeId'])}"
-                            ),
-                            "device_name": functions[0]["name"],
+                            "device_id": device_id_with_fct,
+                            "device_name": f_name,
                         }
                     )
 
                     # Comfort Temperature correction
                     self.devices.append(
                         {
-                            "id": self.slugify(
-                                f"{self.host}/1/{str(device['nodeId'])}{fct_id}/3/58/0"
-                            ),
-                            "name": f"{functions[0]['name']} Comfort Temperature Correction",
+                            "id": self.slugify(f"{self.host}{device_id}{fct_id}/3/58/0"),
+                            "name": f"{f_name} Comfort Temperature Correction",
                             "type": "sensor",
                             "device_class": None,
                             "state_class": None,
                             "unit": "K",
                             "oid": f"{device_id}{fct_id}/3/58/0",
-                            "device_id": self.slugify(
-                                f"{self.host}{str(device['nodeId'])}"
-                            ),
-                            "device_name": functions[0]["name"],
+                            "device_id": device_id_with_fct,
+                            "device_name": f_name,
                         }
                     )
+
                     # Current Temperature correction
                     self.devices.append(
                         {
-                            "id": self.slugify(
-                                f"{self.host}/1/{str(device['nodeId'])}{fct_id}/3/7/0"
-                            ),
-                            "name": f"{functions[0]['name']} Current Temperature Correction",
+                            "id": self.slugify(f"{self.host}{device_id}{fct_id}/3/7/0"),
+                            "name": f"{f_name} Current Temperature Correction",
                             "type": "sensor",
                             "device_class": None,
                             "state_class": None,
                             "unit": "K",
                             "oid": f"{device_id}{fct_id}/3/7/0",
-                            "device_id": self.slugify(
-                                f"{self.host}{str(device['nodeId'])}"
-                            ),
-                            "device_name": functions[0]["name"],
+                            "device_id": device_id_with_fct,
+                            "device_name": f_name,
                         }
                     )
+
                     # Target temperature
                     self.devices.append(
                         {
-                            "id": self.slugify(
-                                f"{self.host}/1/{str(device['nodeId'])}{fct_id}/1/1/0"
-                            ),
-                            "name": f"{functions[0]['name']} Target Temperature",
+                            "id": self.slugify(f"{self.host}{device_id}{fct_id}/1/1/0"),
+                            "name": f"{f_name} Target Temperature",
                             "type": "temperature",
                             "correction_oid": f"{device_id}{fct_id}/3/58/0",
                             "oid": f"{device_id}{fct_id}/1/1/0",
-                            "device_id": self.slugify(
-                                f"{self.host}{str(device['nodeId'])}"
-                            ),
-                            "device_name": functions[0]["name"],
+                            "device_id": device_id_with_fct,
+                            "device_name": f_name,
                         }
                     )
+
                     # Outside temperature
                     self.devices.append(
                         {
-                            "id": self.slugify(
-                                f"{self.host}/1/{str(device['nodeId'])}{fct_id}/0/0/0"
-                            ),
-                            "name": f"{functions[0]['name']} Outside Temperature",
+                            "id": self.slugify(f"{self.host}{device_id}{fct_id}/0/0/0"),
+                            "name": f"{f_name} Outside Temperature",
                             "type": "temperature",
                             "oid": f"{device_id}{fct_id}/0/0/0",
-                            "device_id": self.slugify(
-                                f"{self.host}{str(device['nodeId'])}"
-                            ),
-                            "device_name": functions[0]["name"],
+                            "device_id": device_id_with_fct,
+                            "device_name": f_name,
                         }
                     )
 
