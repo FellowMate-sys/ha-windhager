@@ -184,4 +184,4 @@ class WindhagerClimateBase(CoordinatorEntity, ClimateEntity):
 
     @property
     def target_temperature(self) -> float | None:
-        """
+    
