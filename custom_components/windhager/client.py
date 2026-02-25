@@ -89,11 +89,11 @@ class WindhagerHttpClient:
                             "type": "climate",
                             "prefix": device_id,
                             "oids": [
-                                f"{fct_id}/0/1/0",  # current room temperature
-                                f"{fct_id}/1/1/0",  # target room temperature
-                                f"{fct_id}/3/50/0", # mode
-                                f"{fct_id}/2/10/0", # duration (custom temp)
-                                f"{fct_id}/3/58/0", # comfort correction
+                                f"{device_id}{fct_id}/0/1/0",  # current room temperature
+                                f"{device_id}{fct_id}/1/1/0",  # target room temperature
+                                f"{device_id}{fct_id}/3/50/0", # mode
+                                f"{device_id}{fct_id}/2/10/0", # duration (custom temp)
+                                f"{device_id}{fct_id}/3/58/0", # comfort correction
                             ],
                             "device_id": device_id_with_fct,
                             "device_name": f_name,
