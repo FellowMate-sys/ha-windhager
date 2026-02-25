@@ -74,7 +74,7 @@ class WindhagerHttpClient:
             self._session = None
             self._auth = None
 
-    async def _lookup(self, oid: str):
+    async def fetch(self, oid: str):
         """GET /api/1.0/lookup<oid>"""
         await self._ensure_session()
         url = f"http://{self.host}/api/1.0/lookup{oid}"
@@ -223,7 +223,7 @@ class WindhagerHttpClient:
         }}
 
         for oid in sorted(self._oids_to_fetch):
-            js = await self._lookup(oid)
+            js = await self.fetch(oid)
             if not js or "value" not in js:
                 ret["oids"][oid] = None
                 continue
